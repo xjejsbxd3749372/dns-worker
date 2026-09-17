@@ -1,0 +1,287 @@
+import React, { useEffect, useState, useMemo } from "react";
+import { Intent } from "@blueprintjs/core";
+import { useTranslation } from "react-i18next";
+import { getPresetRegions, type RegionConfigItem } from "../../config/regions";
+import { setSystemTimeZone } from "../../utils/date";
+
+import type {  SetupViewProps, ClientInfo  } from "./types";
+import { useIsMobile } from "../../hooks/useIsMobile";
+import { SetupHeader } from "./components/SetupHeader";
+import { VerifyConnectionCard } from "./components/VerifyConnectionCard";
+import { AccessPointCard } from "./components/AccessPointCard";
+import { DohUrlCard } from "./components/DohUrlCard";
+import { SetupTabs } from "./components/SetupTabs";
+import { AccessPointDrawer } from "./components/AccessPointDrawer";
+import type { AccessPoint } from "../../types/auth";
+import {
+  getClientInfo,
+  getRegions,
+  getSubstituteInfo,
+  getTraceInfo,
+  queryDnsJson,
+  getProfileAccessPoints,
+  getProfileDetails,
+} from "../../services";
+
+export const SetupView: React.FC<SetupViewProps> = ({ profileId, profileKey, profileName, toasterRef }) => {
+  const isMobile = useIsMobile();
+  const { t, i18n } = useTranslation();
+  const presetRegions = useMemo(() => getPresetRegions(t), [i18n.language, t]);
+  
+  const [accessPoints, setAccessPoints] = useState<AccessPoint[]>([]);
+  const [loadingAccessPoints, setLoadingAccessPoints] = useState(false);
+  const [isAccessPointDrawerOpen, setIsAccessPointDrawerOpen] = useState(false);
+  const [selectedApId, setSelectedApId] = useState<string | null>(null);
+
+  const fetchAccessPoints = async () => {
+    setLoadingAccessPoints(true);
+    try {
+      const data = await getProfileAccessPoints(profileId);
+      setAccessPoints(data);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingAccessPoints(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchAccessPoints();
+  }, [profileId]);
+
+  const [currentProfileName, setCurrentProfileName] = useState<string>(profileName || "");
+
+  useEffect(() => {
+    if (profileName) {
+      setCurrentProfileName(profileName);
+    } else if (profileId) {
+      getProfileDetails(profileId)
+        .then((data: any) => {
+          if (data?.name) setCurrentProfileName(data.name);
+        })
+        .catch(() => {});
+    }
+  }, [profileId, profileName]);
+
+  const activeAp = useMemo(() => {
+    if (accessPoints.length === 0) return null;
+    return accessPoints.find(ap => ap.id === selectedApId) || accessPoints[0];
+  }, [accessPoints, selectedApId]);
+
+  const activeToken = activeAp ? activeAp.token : profileKey;
+  const activeName = activeAp ? activeAp.name : undefined;
+  const dohUrl = `${window.location.origin}/${activeToken}`;
+  const [clientInfo, setClientInfo] = useState<ClientInfo | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [substituteDomainIp, setSubstituteDomainIp] = useState<string | null>(null);
+  const [substituteDomainIpv6, setSubstituteDomainIpv6] = useState<string | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<string>("CN");
+  const [showIp, setShowIp] = useState(false);
+  const [showLocation, setShowLocation] = useState(false);
+  const [traceInfo, setTraceInfo] = useState<{ colo: string; raw: string } | null>(null);
+  const [serverRegions, setServerRegions] = useState<Record<string, RegionConfigItem>>({});
+  const [verifyResult, setVerifyResult] = useState<{ success: boolean; profileMatch: boolean } | null>(null);
+
+  const OTHER_REGION: RegionConfigItem = {
+    label: t("setup.otherRegion"),
+    ips: [],
+    countries: [],
+  };
+
+  const allRegions = useMemo<Record<string, RegionConfigItem>>(() => {
+    return { ...presetRegions, ...serverRegions, Other: OTHER_REGION };
+  }, [presetRegions, serverRegions, OTHER_REGION]);
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    toasterRef?.current?.show({
+      message: t("setup.copied"),
+      intent: Intent.SUCCESS,
+    });
+  };
+
+  const resolveSubstituteDomain = async (domain: string) => {
+    const tryResolve = async (server: string, type: string, typeNum: number): Promise<string | null> => {
+      try {
+        const data = await queryDnsJson(server, domain, type);
+        if (data.Answer && data.Answer.length > 0) {
+          const record = data.Answer.find((a: any) => a.type === typeNum);
+          if (record?.data) return record.data;
+        }
+      } catch (e) {
+        console.warn(`Client-side DNS query failed for ${domain} (${type}) via ${server}:`, e);
+      }
+      return null;
+    };
+
+    const servers = ["cloudflare-dns.com", "1.1.1.1"];
+
+    // Try resolving A record
+    let ipA: string | null = null;
+    for (const server of servers) {
+      ipA = await tryResolve(server, "A", 1);
+      if (ipA) break;
+    }
+    if (ipA) setSubstituteDomainIp(ipA);
+
+    // Try resolving AAAA record
+    let ipAAAA: string | null = null;
+    for (const server of servers) {
+      ipAAAA = await tryResolve(server, "AAAA", 28);
+      if (ipAAAA) break;
+    }
+    if (ipAAAA) setSubstituteDomainIpv6(ipAAAA);
+  };
+
+  const handleVerify = async () => {
+    setIsVerifying(true);
+    setVerifyResult(null);
+    try {
+      const [clientData, regionsData, traceResult] = await Promise.all([
+        getClientInfo(),
+        getRegions(),
+        getTraceInfo(),
+      ]);
+
+      setClientInfo(clientData);
+      setTraceInfo(traceResult);
+
+      if (clientData.timezone && clientData.timezone !== "UNKNOWN") {
+        setSystemTimeZone(clientData.timezone);
+      }
+
+      const domainToResolve = clientData.substituteDomain || "pages.dev";
+      
+      try {
+        const substituteData = await getSubstituteInfo();
+        if (substituteData.ip) {
+          setSubstituteDomainIp(substituteData.ip);
+        }
+        if (substituteData.ipv6) {
+          setSubstituteDomainIpv6(substituteData.ipv6);
+        }
+        
+        if (!substituteData.ip || !substituteData.ipv6) {
+          resolveSubstituteDomain(domainToResolve);
+        }
+      } catch (e) {
+        console.warn("Backend substitute lookup failed, falling back to client-side DNS lookup", e);
+        resolveSubstituteDomain(domainToResolve);
+      }
+
+      if (regionsData) {
+        const enriched: Record<string, RegionConfigItem> = {};
+        for (const [key, ips] of Object.entries(regionsData)) {
+          enriched[key] = {
+            label: presetRegions[key]?.label || key,
+            countries: presetRegions[key]?.countries || [],
+            ips: ips as any,
+          };
+        }
+        setServerRegions(enriched);
+      }
+
+      if (clientData.country) {
+        let matched = false;
+        for (const [key, config] of Object.entries(presetRegions)) {
+          if (config.countries.includes(clientData.country)) {
+            setSelectedRegion(key);
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          setSelectedRegion("Other");
+        }
+      }
+
+      setVerifyResult({
+        success: !!clientData.connectedProfileId,
+        profileMatch: clientData.connectedProfileId === profileId,
+      });
+    } catch (e) {
+      console.error("Verification failed", e);
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  useEffect(() => {
+    handleVerify();
+  }, [profileId]); // Ensure it only runs once unless profileId changes
+
+  const currentIps = useMemo(() => {
+    const region = allRegions[selectedRegion] || OTHER_REGION;
+    const baseIps: { ip: string; area: string | null }[] = [...region.ips];
+    const domain = clientInfo?.substituteDomain || "pages.dev";
+    if (substituteDomainIpv6) {
+      baseIps.unshift({
+        ip: substituteDomainIpv6,
+        area: t("setup.dynamicFromDomainV6", { domain }) as string,
+      });
+    }
+    if (substituteDomainIp) {
+      baseIps.unshift({
+        ip: substituteDomainIp,
+        area: t("setup.dynamicFromDomain", { domain }) as string,
+      });
+    }
+    return baseIps;
+  }, [selectedRegion, allRegions, substituteDomainIp, substituteDomainIpv6, clientInfo, t, OTHER_REGION]);
+
+  return (
+    <div className={`mx-auto space-y-8 pb-24 ${isMobile ? "p-1" : "px-8 max-w-5xl"}`}>
+      <SetupHeader isMobile={isMobile} selectedRegion={selectedRegion} setSelectedRegion={setSelectedRegion} allRegions={allRegions} />
+
+      <VerifyConnectionCard
+        isVerifying={isVerifying}
+        verifyResult={verifyResult}
+        handleVerify={handleVerify}
+        isMobile={isMobile}
+        clientInfo={clientInfo}
+        showIp={showIp}
+        setShowIp={setShowIp}
+        showLocation={showLocation}
+        setShowLocation={setShowLocation}
+        traceInfo={traceInfo}
+      />
+
+      <AccessPointCard
+        accessPoints={accessPoints}
+        selectedApId={activeAp?.id || null}
+        onSelectAp={setSelectedApId}
+        accessPointName={activeName}
+        onManageAccessPoints={() => setIsAccessPointDrawerOpen(true)}
+        isMobile={isMobile}
+      />
+
+      <DohUrlCard 
+        dohUrl={dohUrl} 
+        copyToClipboard={copyToClipboard} 
+        isMobile={isMobile} 
+      />
+
+      <SetupTabs
+        isMobile={isMobile}
+        copyToClipboard={copyToClipboard}
+        profileKey={activeToken}
+        profileName={currentProfileName || undefined}
+        accessPointName={activeName}
+        allRegions={allRegions}
+        selectedRegion={selectedRegion}
+        currentIps={currentIps}
+      />
+
+      <AccessPointDrawer
+        isOpen={isAccessPointDrawerOpen}
+        onClose={() => setIsAccessPointDrawerOpen(false)}
+        profileId={profileId}
+        isMobile={isMobile}
+        accessPoints={accessPoints}
+        loading={loadingAccessPoints}
+        onRefresh={fetchAccessPoints}
+        toasterRef={toasterRef as any}
+      />
+    </div>
+  );
+};

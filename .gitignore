@@ -1,0 +1,13 @@
+node_modules
+static
+dist
+build
+.wrangler
+package-lock.json
+/web/stats.html
+.env
+.vscode
+data/
+*.sqlite*
+dev-dist
+.dev.vars

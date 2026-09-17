@@ -1,0 +1,341 @@
+import React, { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  validateUsername,
+  validatePassword,
+  isPasswordLeaked,
+  hashTotpToken,
+  hashPasswordClient,
+  formatApiErrorMessage
+} from "../../utils/auth";
+import {
+  checkUsernameDuplicate as checkUsernameDuplicateService,
+  signup,
+  setupTotp,
+  confirmTotp,
+  getPasskeyRegistrationOptions,
+  verifyPasskeyRegistration,
+  ApiError
+} from "../../services";
+import { setAccessToken } from "../../utils/token";
+import { startPasskeyRegistration } from "../../utils/webauthn";
+
+interface AuthConfig {
+  turnstile_site_key: string;
+  turnstile_enabled_signup: boolean;
+  turnstile_enabled_login: boolean;
+}
+
+export interface UseSignupWizardProps {
+  authConfig: AuthConfig | null;
+  turnstileReady: boolean;
+  onSuccess: () => void;
+}
+
+/**
+ * Custom hook to manage SignupWizard's state and workflow submissions.
+ *
+ * @param props - Hook props.
+ * @returns State and event handlers for SignupWizard.
+ */
+export const useSignupWizard = ({
+  authConfig,
+  turnstileReady,
+  onSuccess
+}: UseSignupWizardProps) => {
+  const [signupStep, setSignupStep] = useState<
+    "username" | "password" | "totp" | "recovery"
+  >("username");
+
+  // Input states
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [totpSetupToken, setTotpSetupToken] = useState("");
+
+  // TOTP response states
+  const [totpSetupData, setTotpSetupData] = useState<{
+    secret: string;
+    uri: string;
+  } | null>(null);
+  const [totpRecoveryKeys, setTotpRecoveryKeys] = useState<string[] | null>(
+    null
+  );
+
+  // Status indicators
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [usernameFocused, setUsernameFocused] = useState(false);
+  const [passwordFocused, setPasswordFocused] = useState(false);
+  const [copiedRecovery, setCopiedRecovery] = useState(false);
+
+  // Setup/verification loading indicators
+  const [totpSetupLoading, setTotpSetupLoading] = useState(false);
+  const [totpSetupError, setTotpSetupError] = useState("");
+
+  // MFA selection & passkey states
+  const [mfaChoice, setMfaChoice] = useState<"choose" | "totp">("choose");
+  const [passkeyRegLoading, setPasskeyRegLoading] = useState(false);
+  const [passkeyRegError, setPasskeyRegError] = useState("");
+
+  // Turnstile state
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [turnstileStatus, setTurnstileStatus] = useState<
+    "idle" | "verifying" | "success" | "error"
+  >("idle");
+  const turnstileRef = useRef<HTMLDivElement>(null);
+  const widgetIdRef = useRef<string | null>(null);
+
+  const { t } = useTranslation();
+
+  const isTurnstileEnabled = authConfig?.turnstile_enabled_signup;
+
+  useEffect(() => {
+    // Only render turnstile in Step 2 (password step)
+    if (
+      signupStep === "password" &&
+      isTurnstileEnabled &&
+      authConfig?.turnstile_site_key &&
+      (turnstileReady || window.turnstile) &&
+      turnstileRef.current
+    ) {
+      try {
+        if (widgetIdRef.current && window.turnstile) {
+          window.turnstile.remove(widgetIdRef.current);
+          widgetIdRef.current = null;
+        }
+        setTurnstileStatus("verifying");
+        turnstileRef.current.innerHTML = "";
+        const widgetId = window.turnstile.render(turnstileRef.current, {
+          sitekey: authConfig.turnstile_site_key,
+          callback: (token: string) => {
+            setTurnstileToken(token);
+            setTurnstileStatus("success");
+            setError("");
+          },
+          "expired-callback": () => {
+            setTurnstileToken(null);
+            setTurnstileStatus("idle");
+          },
+          "error-callback": (err: unknown) => {
+            console.error("Turnstile error:", err);
+            setTurnstileStatus("error");
+            setError(
+              t(
+                "auth.turnstileError",
+                "Verification service failed to load. Please reload and try again."
+              )
+            );
+            setTurnstileToken(null);
+          }
+        });
+        widgetIdRef.current = widgetId;
+      } catch (e) {
+        console.error("Turnstile render error:", e);
+        setTurnstileStatus("error");
+      }
+    }
+    return () => {
+      if (widgetIdRef.current && window.turnstile) {
+        window.turnstile.remove(widgetIdRef.current);
+        widgetIdRef.current = null;
+      }
+    };
+  }, [isTurnstileEnabled, authConfig, signupStep, turnstileReady, t]);
+
+  const checkUsernameDuplicate = async (uname: string) => {
+    if (!uname || !validateUsername(uname)) return;
+    try {
+      const exists = await checkUsernameDuplicateService(uname);
+      if (exists) {
+        setError(t("auth.usernameExists"));
+      } else {
+        setError((prev) => (prev === t("auth.usernameExists") ? "" : prev));
+      }
+    } catch (e) {
+      console.error("Failed to check username duplicate", e);
+    }
+  };
+
+  const handleSignupUsernameSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!validateUsername(username)) {
+      setError(t("auth.formatTipUsername"));
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    try {
+      const exists = await checkUsernameDuplicateService(username);
+      if (exists) {
+        setError(t("auth.usernameExists"));
+      } else {
+        setSignupStep("password");
+      }
+    } catch (err) {
+      setError(t("auth.networkError"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const startSignupTotpSetup = async () => {
+    setTotpSetupLoading(true);
+    setTotpSetupError("");
+    try {
+      const data = await setupTotp();
+      setTotpSetupData(data);
+      setSignupStep("totp");
+    } catch (e) {
+      console.error("Network error during signup TOTP setup:", e);
+      onSuccess();
+    } finally {
+      setTotpSetupLoading(false);
+    }
+  };
+
+  const handleChooseTotp = async () => {
+    setMfaChoice("totp");
+    await startSignupTotpSetup();
+  };
+
+  const handleRegisterPasskey = async () => {
+    setPasskeyRegLoading(true);
+    setPasskeyRegError("");
+    try {
+      const options = await getPasskeyRegistrationOptions();
+      const credential = await startPasskeyRegistration(options);
+      const res = await verifyPasskeyRegistration({ name: "primary_passkey", credential });
+      if (res.recovery_keys && res.recovery_keys.length > 0) {
+        setTotpRecoveryKeys(res.recovery_keys);
+        setSignupStep("recovery");
+      } else {
+        onSuccess();
+      }
+    } catch (err: any) {
+      console.error("Passkey registration failed:", err);
+      setPasskeyRegError(formatApiErrorMessage(err, t));
+    } finally {
+      setPasskeyRegLoading(false);
+    }
+  };
+
+  const handleSignupTotpConfirm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!totpSetupData) return;
+    setTotpSetupLoading(true);
+    setTotpSetupError("");
+    try {
+      const rawToken = totpSetupToken.replace(/\s/g, "");
+      const salt = crypto.randomUUID();
+      const hashHex = await hashTotpToken(rawToken, salt);
+
+      const data = await confirmTotp({
+        secret: totpSetupData.secret,
+        totpTokenHash: hashHex,
+        salt
+      });
+      setTotpRecoveryKeys(data.recovery_keys);
+      setSignupStep("recovery");
+    } catch (err: any) {
+      setTotpSetupError(err.message || t("common.errorNetwork"));
+    } finally {
+      setTotpSetupLoading(false);
+    }
+  };
+
+  const handleCopySignupRecoveryKeys = () => {
+    if (!totpRecoveryKeys) return;
+    navigator.clipboard.writeText(totpRecoveryKeys.join("\n")).then(() => {
+      setCopiedRecovery(true);
+      setTimeout(() => setCopiedRecovery(false), 2000);
+    });
+  };
+
+  const handleSignupSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!validateUsername(username)) {
+      setError(t("auth.formatTipUsername"));
+      return;
+    }
+    if (!validatePassword(password)) {
+      setError(t("auth.formatTipPassword"));
+      return;
+    }
+    if (isTurnstileEnabled && authConfig?.turnstile_site_key && !turnstileToken) {
+      setError(t("auth.turnstileRequired"));
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    try {
+      const clientHash = await hashPasswordClient(password, username);
+      const data = await signup({
+        username,
+        password: clientHash,
+        turnstileToken
+      });
+
+      if (data.accessToken) {
+        setAccessToken(data.accessToken);
+      }
+      setMfaChoice("choose");
+      setSignupStep("totp");
+    } catch (err: any) {
+      if (err instanceof ApiError) {
+        const fakeRes = { status: err.status } as Response;
+        if (isPasswordLeaked(fakeRes, err.bodyText)) {
+          setError(t("auth.passwordLeaked"));
+        } else {
+          setError(formatApiErrorMessage(err, t));
+        }
+      } else {
+        setError(formatApiErrorMessage(err, t));
+      }
+      if (window.turnstile) window.turnstile.reset();
+      setTurnstileToken(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return {
+    signupStep,
+    setSignupStep,
+    username,
+    setUsername,
+    password,
+    setPassword,
+    mfaChoice,
+    setMfaChoice,
+    passkeyRegLoading,
+    passkeyRegError,
+    handleRegisterPasskey,
+    handleChooseTotp,
+    totpSetupToken,
+    setTotpSetupToken,
+    totpSetupData,
+    setTotpSetupData,
+    totpRecoveryKeys,
+    setTotpRecoveryKeys,
+    loading,
+    error,
+    setError,
+    usernameFocused,
+    setUsernameFocused,
+    passwordFocused,
+    setPasswordFocused,
+    copiedRecovery,
+    totpSetupLoading,
+    totpSetupError,
+    turnstileStatus,
+    turnstileRef,
+    isTurnstileEnabled,
+    checkUsernameDuplicate,
+    handleSignupUsernameSubmit,
+    handleSignupTotpConfirm,
+    handleCopySignupRecoveryKeys,
+    handleSignupSubmit
+  };
+};
